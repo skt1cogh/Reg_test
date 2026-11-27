@@ -1,24 +1,21 @@
 import streamlit as st
 import tiktoken
-from operator import itemgetter
 from loguru import logger
 
 from langchain_core.messages import ChatMessage
-from langchain_community.chat_models import ChatOllama
 from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
 from langchain_core.runnables.history import RunnableWithMessageHistory
-
-from langchain.document_loaders import PyPDFLoader
-from langchain.document_loaders import Docx2txtLoader
-from langchain.document_loaders import UnstructuredPowerPointLoader
-
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain_core.output_parsers import StrOutputParser
-
-from langchain.vectorstores import FAISS
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables import RunnablePassthrough
+
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import Docx2txtLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+
 from langserve import RemoteRunnable
 
 
@@ -30,10 +27,9 @@ def tiktoken_len(text):
 
 def get_text(docs):
     doc_list = []
-
     for doc in docs:
-        file_name = doc.name  # doc 객체의 이름을 파일 이름으로 사용
-        with open(file_name, "wb") as file:  # 파일을 doc.name으로 저장
+        file_name = doc.name
+        with open(file_name, "wb") as file:
             file.write(doc.getvalue())
             logger.info(f"Uploaded {file_name}")
         if '.pdf' in doc.name:
@@ -42,10 +38,6 @@ def get_text(docs):
         elif '.docx' in doc.name:
             loader = Docx2txtLoader(file_name)
             documents = loader.load_and_split()
-        elif '.pptx' in doc.name:
-            loader = UnstructuredPowerPointLoader(file_name)
-            documents = loader.load_and_split()
-
         doc_list.extend(documents)
     return doc_list
 
@@ -70,147 +62,106 @@ def get_vectorstore(text_chunks):
     return vectordb
 
 
-def main():
-    global retriever
+def format_docs(docs):
+    return "\n\n".join(doc.page_content for doc in docs)
 
+
+def main():
     st.set_page_config(
-        page_title="Streamlit_remote_RAG",
+        page_title="RAG_test4",
         page_icon=":books:"
     )
 
     st.title("_RAG_test4 :red[Q/A Chat]_ :books:")
 
-    # 화면 출력용 대화 기록 초기화 (ChatMessage 객체로 통일)
+    if "store" not in st.session_state:
+        st.session_state.store = {}
+
     if "messages" not in st.session_state:
         st.session_state["messages"] = [
-            ChatMessage(role="assistant", content="안녕하세요! 주어진 문서에 대해 궁금하신 것이 있으면 언제든 물어봐주세요!")
+            {"role": "assistant", "content": "안녕하세요! 주어진 문서에 대해 궁금하신 것이 있으면 언제든 물어봐주세요!"}
         ]
-
-    # LLM 기억용 세션 대화 기록 저장소 초기화
-    if "store" not in st.session_state:
-        st.session_state["store"] = dict()
-
-    # 세션 ID별 대화 히스토리를 가져오는 함수
-    def get_session_history(session_ids):
-        if session_ids not in st.session_state["store"]:
-            st.session_state["store"][session_ids] = ChatMessageHistory()
-        return st.session_state["store"][session_ids]
-
-    def print_history():
-        for msg in st.session_state.messages:
-            st.chat_message(msg.role).write(msg.content)
-
-    def add_history(role, content):
-        st.session_state.messages.append(ChatMessage(role=role, content=content))
 
     if "processComplete" not in st.session_state:
         st.session_state.processComplete = None
-
-    if "retriever" not in st.session_state:
-        st.session_state.retriever = None
 
     with st.sidebar:
         uploaded_files = st.file_uploader("Upload your file", type=['pdf', 'docx'], accept_multiple_files=True)
         process = st.button("Process")
 
-    if process and uploaded_files:
+    if process:
+        if not uploaded_files:
+            st.warning("파일을 먼저 업로드해주세요.")
+            st.stop()
         files_text = get_text(uploaded_files)
         text_chunks = get_text_chunks(files_text)
-        vectorstore = get_vectorstore(text_chunks)
-        retriever = vectorstore.as_retriever(search_type='mmr', verbose=True)  # 원본 오타(vervose) 수정
-        st.session_state['retriever'] = retriever
+        vetorestore = get_vectorstore(text_chunks)
+        st.session_state.retriever = vetorestore.as_retriever(search_type='mmr', verbose=True)
         st.session_state.processComplete = True
+        st.success("문서 처리가 완료되었습니다!")
 
-    def format_docs(docs):
-        # 검색한 문서 결과를 하나의 문단으로 합쳐줍니다.
-        return "\n\n".join(doc.page_content for doc in docs)
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-    # 이전 대화 기록(chat_history)도 참고할 수 있도록 프롬프트 구성
-    RAG_PROMPT_TEMPLATE = """당신은 동서울대학교 컴퓨터소프트웨어과 안내 AI 입니다.
-검색된 문맥(Context)과 이전 대화 기록(Chat History)을 사용하여 질문에 맞는 답변을 30단어 이내로 하세요.
-답을 모른다면 모른다고 답변하세요.
+    def get_session_history(session_ids: str) -> BaseChatMessageHistory:
+        if session_ids not in st.session_state.store:
+            st.session_state.store[session_ids] = ChatMessageHistory()
+        return st.session_state.store[session_ids]
 
-Context: {context}"""
+    # 본인의 Ngrok 고정 도메인 적용 완료
+    llm = RemoteRunnable("https://extenuate-herbs-alone.ngrok-free.dev/llm/")
 
-    print_history()
-
-    if user_input := st.chat_input("메세지를 입력해 주세요"):
-        # 사용자가 입력한 내용 저장 및 출력
-        add_history("user", user_input)
-        st.chat_message("user").write(f"{user_input}")
+    if query := st.chat_input("질문을 입력해주세요."):
+        st.session_state.messages.append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
 
         with st.chat_message("assistant"):
-            # ※ 본인의 Colab/로컬 LangServe ngrok 주소로 변경해서 사용하세요.
-            llm = RemoteRunnable("https://centrally-exciting-liger.ngrok-free.app/llm/")
-            chat_container = st.empty()
-
-            # 1. 문서 업로드 후 RAG 시스템이 동작할 때
-            if st.session_state.processComplete == True:
-                prompt1 = ChatPromptTemplate.from_messages([
-                    ("system", RAG_PROMPT_TEMPLATE),
-                    MessagesPlaceholder(variable_name="chat_history"),
+            if st.session_state.processComplete:
+                retriever = st.session_state.retriever
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", "당신은 친절한 AI 어시스턴트입니다. 주어진 문맥(Context)을 바탕으로 질문에 정확하게 한국어로 답변하세요.\n\nContext:\n{context}"),
+                    MessagesPlaceholder(variable_name="history"),
                     ("human", "{question}"),
                 ])
-
-                retriever = st.session_state['retriever']
-
-                # 히스토리 딕셔너리 입력에서 question만 뽑아 retriever에 전달
-                rag_chain = (
+                chain = (
                     {
-                        "context": itemgetter("question") | retriever | format_docs,
-                        "question": itemgetter("question"),
-                        "chat_history": itemgetter("chat_history"),
+                        "context": lambda x: format_docs(retriever.invoke(x["question"])),
+                        "question": lambda x: x["question"],
+                        "history": lambda x: x["history"],
                     }
-                    | prompt1
+                    | prompt
                     | llm
                     | StrOutputParser()
                 )
-
-                rag_with_history = RunnableWithMessageHistory(
-                    rag_chain,
-                    get_session_history,
-                    input_messages_key="question",
-                    history_messages_key="chat_history",
-                )
-
-                answer = rag_with_history.stream(
-                    {"question": user_input},
-                    config={"configurable": {"session_id": "default_session"}},
-                )
-
-                chunks = []
-                for chunk in answer:
-                    chunks.append(chunk)
-                    chat_container.markdown("".join(chunks))
-                add_history("ai", "".join(chunks))
-
-            # 2. 문서를 업로드하지 않고 일반 LLM으로 대화할 때
             else:
-                prompt2 = ChatPromptTemplate.from_messages([
-                    ("system", "다음의 질문에 이전 대화 맥락을 참고하여 간결하게 답변해 주세요."),
-                    MessagesPlaceholder(variable_name="chat_history"),
-                    ("human", "{input}"),
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", "당신은 친절한 AI 어시스턴트입니다. 사용자의 질문에 한국어로 답변하세요."),
+                    MessagesPlaceholder(variable_name="history"),
+                    ("human", "{question}"),
                 ])
+                chain = prompt | llm | StrOutputParser()
 
-                chain = prompt2 | llm | StrOutputParser()
+            chain_with_memory = RunnableWithMessageHistory(
+                chain,
+                get_session_history,
+                input_messages_key="question",
+                history_messages_key="history",
+            )
 
-                chain_with_history = RunnableWithMessageHistory(
-                    chain,
-                    get_session_history,
-                    input_messages_key="input",
-                    history_messages_key="chat_history",
-                )
+            response_placeholder = st.empty()
+            full_response = ""
+            answer = chain_with_memory.stream(
+                {"question": query},
+                config={"configurable": {"session_id": "user_session"}}
+            )
+            for chunk in answer:
+                full_response += chunk
+                response_placeholder.markdown(full_response + "▌")
+            response_placeholder.markdown(full_response)
 
-                answer = chain_with_history.stream(
-                    {"input": user_input},
-                    config={"configurable": {"session_id": "default_session"}},
-                )
-
-                chunks = []
-                for chunk in answer:
-                    chunks.append(chunk)
-                    chat_container.markdown("".join(chunks))
-                add_history("ai", "".join(chunks))
+        st.session_state.messages.append({"role": "assistant", "content": full_response})
 
 
 if __name__ == '__main__':
